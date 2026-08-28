@@ -74,6 +74,7 @@ type Server struct {
 	mu           sync.RWMutex
 	graph        *content.SiteGraph
 	depGraph     *deps.Graph
+	reloadMu     sync.Mutex
 	reloadSignal chan struct{}
 	reloadVer    atomic.Uint64
 }
@@ -129,7 +130,7 @@ func New(
 		hooks:        hooks,
 		preview:      preview,
 		connStates:   make(map[net.Conn]http.ConnState),
-		reloadSignal: make(chan struct{}, 1),
+		reloadSignal: make(chan struct{}),
 	}
 
 	for _, opt := range opts {
@@ -393,12 +394,25 @@ func hasRenderableChanges(changes deps.ChangeSet) bool {
 
 func (s *Server) signalReload() {
 	s.reloadVer.Add(1)
-	select {
-	case s.reloadSignal <- struct{}{}:
-	default:
+	s.reloadMu.Lock()
+	if s.reloadSignal != nil {
+		close(s.reloadSignal)
 	}
+	s.reloadSignal = make(chan struct{})
+	s.reloadMu.Unlock()
+
 }
 
+func (s *Server) reloadNotify() <-chan struct{} {
+
+	s.reloadMu.Lock()
+	defer s.reloadMu.Unlock()
+	if s.reloadSignal == nil {
+		s.reloadSignal = make(chan struct{})
+	}
+	return s.reloadSignal
+
+}
 func (s *Server) watch(ctx context.Context) {
 	w, err := content.NewWatcher()
 	if err != nil {
@@ -594,10 +608,17 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 	for {
+
+		reload := s.reloadNotify()
+		// Avoid missing a reload that happened between reading lastSeen
+		// and subscribing to the current notification channel.
+		if s.writeReloadEvent(w, flusher, &lastSeen) {
+			return
+		}
 		select {
 		case <-notify:
 			return
-		case <-s.reloadSignal:
+		case <-reload:
 			if s.writeReloadEvent(w, flusher, &lastSeen) {
 				return
 			}
@@ -606,6 +627,7 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+
 	}
 }
 
