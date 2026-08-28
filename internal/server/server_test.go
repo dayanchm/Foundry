@@ -619,3 +619,58 @@ func writeServerTheme(t *testing.T, cfg *config.Config) {
 		}
 	}
 }
+
+func TestReloadBroadcastsToAllClients(t *testing.T) {
+	s := &Server{
+		reloadSignal: make(chan struct{}, 1),
+	}
+
+	type result struct {
+		body string
+	}
+
+	runClient := func(ctx context.Context, ch chan<- result) {
+		req := httptest.NewRequest(http.MethodGet, "/__reload", nil).WithContext(ctx)
+		rr := httptest.NewRecorder()
+
+		s.handleReload(rr, req)
+
+		ch <- result{body: rr.Body.String()}
+	}
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+
+	results := make(chan result, 2)
+
+	go runClient(ctx1, results)
+	go runClient(ctx2, results)
+
+	time.Sleep(50 * time.Millisecond)
+
+	s.signalReload()
+
+	time.Sleep(100 * time.Millisecond)
+
+	cancel1()
+	cancel2()
+
+	var got []result
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-results:
+			got = append(got, r)
+		case <-time.After(2 * time.Second):
+			t.Fatal("reload handler did not exit")
+		}
+	}
+
+	for i, r := range got {
+		if !strings.Contains(r.body, `"reload":true`) {
+			t.Errorf("client %d did not receive reload event: %q", i+1, r.body)
+		}
+	}
+}
