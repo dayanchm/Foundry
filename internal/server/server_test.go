@@ -120,15 +120,23 @@ func TestServerHelpersAndHandlers(t *testing.T) {
 	if got := s.reloadVer.Load(); got != 0 {
 		t.Fatalf("expected initial reload version to be zero, got %d", got)
 	}
+	firstReload := s.reloadNotify()
 	s.signalReload()
+	select {
+	case <-firstReload:
+	default:
+		t.Fatal("expected first reload notification")
+	}
+
+	secondReload := s.reloadNotify()
 	s.signalReload()
 	if got := s.reloadVer.Load(); got != 2 {
 		t.Fatalf("expected reload version to increment, got %d", got)
 	}
 	select {
-	case <-s.reloadSignal:
+	case <-secondReload:
 	default:
-		t.Fatal("expected reload signal")
+		t.Fatal("expected second reload notification")
 	}
 
 	if got := s.listenURL(); got != "http://localhost:8080" {
