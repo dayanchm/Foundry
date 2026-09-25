@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -81,6 +82,37 @@ func (w *responseWriterNoFlush) Header() http.Header {
 }
 func (w *responseWriterNoFlush) Write(b []byte) (int, error) { return w.body.Write(b) }
 func (w *responseWriterNoFlush) WriteHeader(status int)      { w.status = status }
+
+type reloadStreamResponseWriter struct {
+	header  http.Header
+	mu      sync.Mutex
+	body    strings.Builder
+	flushes chan string
+}
+
+func newReloadStreamResponseWriter() *reloadStreamResponseWriter {
+	return &reloadStreamResponseWriter{
+		header:  make(http.Header),
+		flushes: make(chan string, 4),
+	}
+}
+
+func (w *reloadStreamResponseWriter) Header() http.Header { return w.header }
+
+func (w *reloadStreamResponseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(b)
+}
+
+func (w *reloadStreamResponseWriter) WriteHeader(int) {}
+
+func (w *reloadStreamResponseWriter) Flush() {
+	w.mu.Lock()
+	body := w.body.String()
+	w.mu.Unlock()
+	w.flushes <- body
+}
 
 func TestServerHelpersAndHandlers(t *testing.T) {
 	cfg := testServerConfig(t)
@@ -749,28 +781,54 @@ func writeServerTheme(t *testing.T, cfg *config.Config) {
 
 func TestReloadBroadcastsToAllClients(t *testing.T) {
 	s := &Server{
-		reloadSignal: make(chan struct{}, 1),
+		reloadSignal: make(chan struct{}),
 	}
 
-	clients := []<-chan struct{}{s.reloadNotify(), s.reloadNotify()}
+	ctx, cancel := context.WithCancel(context.Background())
+	clients := []*reloadStreamResponseWriter{
+		newReloadStreamResponseWriter(),
+		newReloadStreamResponseWriter(),
+	}
+	done := make(chan struct{}, len(clients))
+	defer func() {
+		cancel()
+		for range clients {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("reload handler did not stop after cancellation")
+			}
+		}
+	}()
+
+	for _, client := range clients {
+		go func(w *reloadStreamResponseWriter) {
+			s.handleReload(w, httptest.NewRequest(http.MethodGet, "/__reload", nil).WithContext(ctx))
+			done <- struct{}{}
+		}(client)
+	}
+
+	for i, client := range clients {
+		select {
+		case <-client.flushes:
+			if got := client.Header().Get("Content-Type"); got != "text/event-stream" {
+				t.Fatalf("client %d content type = %q, want text/event-stream", i+1, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("client %d SSE handler did not become ready", i+1)
+		}
+	}
+
 	s.signalReload()
 
-	for i, notify := range clients {
+	for i, client := range clients {
 		select {
-		case <-notify:
-		default:
-			t.Fatalf("client %d did not receive reload notification", i+1)
-		}
-	}
-
-	for i := range clients {
-		rr := httptest.NewRecorder()
-		lastSeen := uint64(0)
-		if s.writeReloadEvent(rr, rr, &lastSeen) {
-			t.Fatalf("client %d could not write reload event", i+1)
-		}
-		if !strings.Contains(rr.Body.String(), `"reload":true`) {
-			t.Errorf("client %d did not receive reload event: %q", i+1, rr.Body.String())
+		case body := <-client.flushes:
+			if !strings.Contains(body, `"reload":true`) {
+				t.Errorf("client %d did not receive reload event: %q", i+1, body)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("client %d SSE handler did not flush reload event", i+1)
 		}
 	}
 }

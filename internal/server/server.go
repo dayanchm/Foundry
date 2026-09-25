@@ -609,11 +609,11 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 	notify := r.Context().Done()
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
+	reload := s.reloadNotify()
+	// Flush the response headers once the stream is subscribed so clients can
+	// observe that the SSE connection is ready.
+	flusher.Flush()
 	for {
-
-		reload := s.reloadNotify()
-		// Avoid missing a reload that happened between reading lastSeen
-		// and subscribing to the current notification channel.
 		if s.writeReloadEvent(w, flusher, &lastSeen) {
 			return
 		}
@@ -621,15 +621,11 @@ func (s *Server) handleReload(w http.ResponseWriter, r *http.Request) {
 		case <-notify:
 			return
 		case <-reload:
-			if s.writeReloadEvent(w, flusher, &lastSeen) {
-				return
-			}
 		case <-ticker.C:
-			if s.writeReloadEvent(w, flusher, &lastSeen) {
-				return
-			}
 		}
-
+		// Re-subscribe after each notification. A reload between the version
+		// check above and this subscription is still detected by the next check.
+		reload = s.reloadNotify()
 	}
 }
 
