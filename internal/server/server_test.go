@@ -752,52 +752,25 @@ func TestReloadBroadcastsToAllClients(t *testing.T) {
 		reloadSignal: make(chan struct{}, 1),
 	}
 
-	type result struct {
-		body string
-	}
-
-	runClient := func(ctx context.Context, ch chan<- result) {
-		req := httptest.NewRequest(http.MethodGet, "/__reload", nil).WithContext(ctx)
-		rr := httptest.NewRecorder()
-
-		s.handleReload(rr, req)
-
-		ch <- result{body: rr.Body.String()}
-	}
-
-	ctx1, cancel1 := context.WithCancel(context.Background())
-	defer cancel1()
-
-	ctx2, cancel2 := context.WithCancel(context.Background())
-	defer cancel2()
-
-	results := make(chan result, 2)
-
-	go runClient(ctx1, results)
-	go runClient(ctx2, results)
-
-	time.Sleep(50 * time.Millisecond)
-
+	clients := []<-chan struct{}{s.reloadNotify(), s.reloadNotify()}
 	s.signalReload()
 
-	time.Sleep(100 * time.Millisecond)
-
-	cancel1()
-	cancel2()
-
-	var got []result
-	for i := 0; i < 2; i++ {
+	for i, notify := range clients {
 		select {
-		case r := <-results:
-			got = append(got, r)
-		case <-time.After(2 * time.Second):
-			t.Fatal("reload handler did not exit")
+		case <-notify:
+		default:
+			t.Fatalf("client %d did not receive reload notification", i+1)
 		}
 	}
 
-	for i, r := range got {
-		if !strings.Contains(r.body, `"reload":true`) {
-			t.Errorf("client %d did not receive reload event: %q", i+1, r.body)
+	for i := range clients {
+		rr := httptest.NewRecorder()
+		lastSeen := uint64(0)
+		if s.writeReloadEvent(rr, rr, &lastSeen) {
+			t.Fatalf("client %d could not write reload event", i+1)
+		}
+		if !strings.Contains(rr.Body.String(), `"reload":true`) {
+			t.Errorf("client %d did not receive reload event: %q", i+1, rr.Body.String())
 		}
 	}
 }
