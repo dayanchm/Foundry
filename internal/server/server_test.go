@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,6 +83,37 @@ func (w *responseWriterNoFlush) Header() http.Header {
 func (w *responseWriterNoFlush) Write(b []byte) (int, error) { return w.body.Write(b) }
 func (w *responseWriterNoFlush) WriteHeader(status int)      { w.status = status }
 
+type reloadStreamResponseWriter struct {
+	header  http.Header
+	mu      sync.Mutex
+	body    strings.Builder
+	flushes chan string
+}
+
+func newReloadStreamResponseWriter() *reloadStreamResponseWriter {
+	return &reloadStreamResponseWriter{
+		header:  make(http.Header),
+		flushes: make(chan string, 4),
+	}
+}
+
+func (w *reloadStreamResponseWriter) Header() http.Header { return w.header }
+
+func (w *reloadStreamResponseWriter) Write(b []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.body.Write(b)
+}
+
+func (w *reloadStreamResponseWriter) WriteHeader(int) {}
+
+func (w *reloadStreamResponseWriter) Flush() {
+	w.mu.Lock()
+	body := w.body.String()
+	w.mu.Unlock()
+	w.flushes <- body
+}
+
 func TestServerHelpersAndHandlers(t *testing.T) {
 	cfg := testServerConfig(t)
 	writeServerTheme(t, cfg)
@@ -120,15 +152,23 @@ func TestServerHelpersAndHandlers(t *testing.T) {
 	if got := s.reloadVer.Load(); got != 0 {
 		t.Fatalf("expected initial reload version to be zero, got %d", got)
 	}
+	firstReload := s.reloadNotify()
 	s.signalReload()
+	select {
+	case <-firstReload:
+	default:
+		t.Fatal("expected first reload notification")
+	}
+
+	secondReload := s.reloadNotify()
 	s.signalReload()
 	if got := s.reloadVer.Load(); got != 2 {
 		t.Fatalf("expected reload version to increment, got %d", got)
 	}
 	select {
-	case <-s.reloadSignal:
+	case <-secondReload:
 	default:
-		t.Fatal("expected reload signal")
+		t.Fatal("expected second reload notification")
 	}
 
 	if got := s.listenURL(); got != "http://localhost:8080" {
@@ -735,6 +775,60 @@ func writeServerTheme(t *testing.T, cfg *config.Config) {
 		}
 		if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
 			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+}
+
+func TestReloadBroadcastsToAllClients(t *testing.T) {
+	s := &Server{
+		reloadSignal: make(chan struct{}),
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	clients := []*reloadStreamResponseWriter{
+		newReloadStreamResponseWriter(),
+		newReloadStreamResponseWriter(),
+	}
+	done := make(chan struct{}, len(clients))
+	defer func() {
+		cancel()
+		for range clients {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Error("reload handler did not stop after cancellation")
+			}
+		}
+	}()
+
+	for _, client := range clients {
+		go func(w *reloadStreamResponseWriter) {
+			s.handleReload(w, httptest.NewRequest(http.MethodGet, "/__reload", nil).WithContext(ctx))
+			done <- struct{}{}
+		}(client)
+	}
+
+	for i, client := range clients {
+		select {
+		case <-client.flushes:
+			if got := client.Header().Get("Content-Type"); got != "text/event-stream" {
+				t.Fatalf("client %d content type = %q, want text/event-stream", i+1, got)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("client %d SSE handler did not become ready", i+1)
+		}
+	}
+
+	s.signalReload()
+
+	for i, client := range clients {
+		select {
+		case body := <-client.flushes:
+			if !strings.Contains(body, `"reload":true`) {
+				t.Errorf("client %d did not receive reload event: %q", i+1, body)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("client %d SSE handler did not flush reload event", i+1)
 		}
 	}
 }
